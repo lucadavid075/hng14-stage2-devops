@@ -11,6 +11,11 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
 
+@app.get("/health")
+def health():
+    r.ping()
+    return {"status": "ok"}
+
 @app.post("/jobs")
 def create_job():
     job_id = str(uuid.uuid4())
