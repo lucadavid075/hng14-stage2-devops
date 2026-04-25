@@ -11,7 +11,7 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
   lint:
-    name: Lint
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +58,7 @@ jobs:
 # STAGE 2 — TEST
 # ─────────────────────────────────────────────────────────────────────────────
   test:
-    name: Test
+    name: test
     runs-on: ubuntu-latest
     needs: lint
     steps:
@@ -90,7 +90,7 @@ jobs:
 # STAGE 3 — BUILD
 # ─────────────────────────────────────────────────────────────────────────────
   build:
-    name: Build
+    name: build
     runs-on: ubuntu-latest
     needs: test
     services:
@@ -115,6 +115,8 @@ jobs:
           tags: |
             localhost:5000/api:${{ github.sha }}
             localhost:5000/api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Build & push worker image
         uses: docker/build-push-action@v5
@@ -124,6 +126,8 @@ jobs:
           tags: |
             localhost:5000/worker:${{ github.sha }}
             localhost:5000/worker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Build & push frontend image
         uses: docker/build-push-action@v5
@@ -133,6 +137,8 @@ jobs:
           tags: |
             localhost:5000/frontend:${{ github.sha }}
             localhost:5000/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Save images as tarballs
         run: |
@@ -171,7 +177,7 @@ jobs:
 # guaranteeing all three files exist before any upload is attempted.
 # ─────────────────────────────────────────────────────────────────────────────
   security:
-    name: Security Scan
+    name: security scan
     runs-on: ubuntu-latest
     needs: build
     permissions:
@@ -244,7 +250,7 @@ jobs:
 # STAGE 5 — INTEGRATION TEST
 # ─────────────────────────────────────────────────────────────────────────────
   integration:
-    name: Integration Test
+    name: integration Test
     runs-on: ubuntu-latest
     needs: security
     steps:
@@ -347,7 +353,7 @@ jobs:
 # STAGE 6 — DEPLOY  (main branch only)
 # ─────────────────────────────────────────────────────────────────────────────
   deploy:
-    name: Deploy
+    name: deploy
     runs-on: ubuntu-latest
     needs: integration
     if: github.ref == 'refs/heads/main'
