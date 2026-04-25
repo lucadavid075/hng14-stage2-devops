@@ -1,5 +1,5 @@
 # Install dependencies
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
@@ -10,9 +10,11 @@ RUN pip install --no-cache-dir --user --upgrade pip==23.3.1 \
 
 
 # Lean production image
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
+
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
 RUN useradd --no-create-home --shell /bin/false --uid 1001 appuser

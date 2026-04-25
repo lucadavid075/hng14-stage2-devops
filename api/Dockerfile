@@ -1,5 +1,5 @@
 # Install dependencies
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
@@ -8,16 +8,25 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --user --upgrade pip==23.3.1 \
     && pip install --no-cache-dir --user -r requirements.txt
 
+
 # Lean production image
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
+
+# Upgrade all OS packages to pick up latest security patches
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
 RUN useradd --no-create-home --shell /bin/false --uid 1001 appuser
 
+# Copy only the installed packages from builder
 COPY --from=builder /root/.local /home/appuser/.local
 
+# Copy application source (no .env files — those are injected at runtime)
 COPY main.py .
 
 RUN chown -R appuser:appuser /app /home/appuser/.local

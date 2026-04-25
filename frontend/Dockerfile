@@ -1,5 +1,5 @@
 # Install production dependencies
-FROM node:18-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /build
 
@@ -9,7 +9,10 @@ RUN npm ci --omit=dev
 
 
 # Lean production image
-FROM node:18-alpine
+FROM node:22-alpine
+
+# Upgrade all apk packages
+RUN apk update && apk upgrade --no-cache
 
 WORKDIR /app
 
@@ -17,8 +20,10 @@ WORKDIR /app
 RUN addgroup --system --gid 1001 appgroup \
     && adduser --system --uid 1001 --ingroup appgroup appuser
 
+# Copy production node_modules from builder
 COPY --from=builder /build/node_modules ./node_modules
 
+# Copy application source (no .env files — injected at runtime)
 COPY app.js .
 COPY views/ ./views/
 
