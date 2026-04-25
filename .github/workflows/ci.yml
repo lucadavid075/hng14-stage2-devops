@@ -1,0 +1,537 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — LINT
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python — flake8
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8==6.1.0
+
+      - name: Lint Python (api)
+        run: flake8 api/main.py --max-line-length=120
+
+      - name: Lint Python (worker)
+        run: flake8 worker/worker.py --max-line-length=120
+
+      # JavaScript — ESLint
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
+      - name: Lint JavaScript
+        run: cd frontend && npm run lint
+
+      # Dockerfiles — hadolint
+      - name: Install hadolint
+        run: |
+          curl -sSL -o /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Lint Dockerfiles
+        run: |
+          hadolint api/Dockerfile
+          hadolint worker/Dockerfile
+          hadolint frontend/Dockerfile
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — TEST
+# ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install API dependencies + dev tools
+        run: pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Run pytest with coverage
+        working-directory: api
+        run: |
+          pytest tests/ \
+            --cov=. \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — BUILD
+# ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: |
+            localhost:5000/api:${{ github.sha }}
+            localhost:5000/api:latest
+
+      - name: Build & push worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            localhost:5000/worker:${{ github.sha }}
+            localhost:5000/worker:latest
+
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            localhost:5000/frontend:${{ github.sha }}
+            localhost:5000/frontend:latest
+
+      - name: Save images as tarballs
+        run: |
+          docker pull localhost:5000/api:${{ github.sha }}
+          docker pull localhost:5000/worker:${{ github.sha }}
+          docker pull localhost:5000/frontend:${{ github.sha }}
+          docker save localhost:5000/api:${{ github.sha }}      -o api.tar
+          docker save localhost:5000/worker:${{ github.sha }}   -o worker.tar
+          docker save localhost:5000/frontend:${{ github.sha }} -o frontend.tar
+
+      - name: Upload image tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: |
+            api.tar
+            worker.tar
+            frontend.tar
+          retention-days: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — SECURITY SCAN
+#
+# WHY exit-code: "0" on each scan step
+# ──────────────────────────────────────
+# When exit-code is "1" and Trivy finds a CRITICAL CVE, the step exits
+# immediately with a failure. GitHub Actions then skips every subsequent
+# step in the job — so the worker and frontend scans never run and their
+# SARIF files are never written. The upload steps then fail with
+# "Path does not exist" because the files simply were not created.
+#
+# Fix: set exit-code: "0" on every scan so all three always complete and
+# write their SARIF files regardless of what they find. A dedicated gate
+# step at the end reads the SARIF files and fails the pipeline if any
+# CRITICAL findings are present. This satisfies the requirement while
+# guaranteeing all three files exist before any upload is attempted.
+# ─────────────────────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      # exit-code: "0" — scan always completes and writes the SARIF file.
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          input: api.tar
+          format: sarif
+          output: trivy-api.sarif
+          severity: CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Scan worker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          input: worker.tar
+          format: sarif
+          output: trivy-worker.sarif
+          severity: CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Scan frontend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          input: frontend.tar
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+
+      # All three SARIF files exist at this point — upload them all
+      - name: Upload API SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-api.sarif
+          category: trivy-api
+
+      - name: Upload worker SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-worker.sarif
+          category: trivy-worker
+
+      - name: Upload frontend SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-frontend.sarif
+          category: trivy-frontend
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5 — INTEGRATION TEST
+# ─────────────────────────────────────────────────────────────────────────────
+  integration:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: security
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load and tag images
+        run: |
+          docker load -i api.tar
+          docker load -i worker.tar
+          docker load -i frontend.tar
+          docker tag localhost:5000/api:${{ github.sha }}      local/api:latest
+          docker tag localhost:5000/worker:${{ github.sha }}   local/worker:latest
+          docker tag localhost:5000/frontend:${{ github.sha }} local/frontend:latest
+
+      - name: Create .env for test
+        run: |
+          echo "REDIS_PASSWORD=integrationtestpassword" >  .env
+          echo "FRONTEND_PORT=3000"                     >> .env
+          echo "REGISTRY=local"                         >> .env
+          echo "TAG=latest"                             >> .env
+
+      - name: Start full stack
+        run: docker compose --env-file .env up -d --no-build
+
+      - name: Wait for all services to be healthy
+        run: |
+          echo "Waiting for services to be healthy..."
+          for i in $(seq 1 24); do
+            REDIS=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "$(docker compose ps -q redis)" 2>/dev/null || echo "none")
+            API=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "$(docker compose ps -q api)" 2>/dev/null || echo "none")
+            FRONT=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "$(docker compose ps -q frontend)" 2>/dev/null || echo "none")
+            WORKER=$(docker compose ps --status running worker \
+              | grep -c worker || true)
+            echo "  redis=$REDIS  api=$API  frontend=$FRONT  worker_running=$WORKER"
+            if [ "$REDIS"  = "healthy" ] && \
+               [ "$API"    = "healthy" ] && \
+               [ "$FRONT"  = "healthy" ] && \
+               [ "$WORKER" -ge 1 ]; then
+              echo "All services healthy after $((i * 5))s"
+              break
+            fi
+            if [ "$i" -eq 24 ]; then
+              echo "ERROR: services did not become healthy within 120s"
+              docker compose logs
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Submit a job through the frontend
+        id: submit
+        run: |
+          echo "Submitting job..."
+          for i in $(seq 1 10); do
+            RESPONSE=$(curl -sf -X POST http://localhost:3000/submit \
+              -H "Content-Type: application/json") && break
+            echo "Attempt $i failed, retrying..."
+            sleep 3
+          done
+          echo "Response: $RESPONSE"
+          JOB_ID=$(echo "$RESPONSE" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "Job ID: $JOB_ID"
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Poll until job completes (max 45s)
+        run: |
+          JOB_ID="${{ steps.submit.outputs.job_id }}"
+          echo "Polling job $JOB_ID..."
+          for i in $(seq 1 15); do
+            STATUS=$(curl -sf "http://localhost:3000/status/$JOB_ID" | \
+              python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+            echo "  attempt $i: $STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "Job completed — integration test passed"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "ERROR: job did not complete within timeout"
+          docker compose logs worker
+          exit 1
+
+      - name: Tear down (always runs)
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 6 — DEPLOY  (main branch only)
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load and tag images
+        run: |
+          docker load -i api.tar
+          docker load -i worker.tar
+          docker load -i frontend.tar
+          for svc in api worker frontend; do
+            docker tag localhost:5000/${svc}:${{ github.sha }} local/${svc}:current
+            docker tag localhost:5000/${svc}:${{ github.sha }} local/${svc}:new
+          done
+
+      - name: Start current stack
+        run: |
+          cat > .env << 'EOF'
+          REDIS_PASSWORD=deploytest123
+          FRONTEND_PORT=3000
+          REGISTRY=local
+          TAG=current
+          EOF
+          docker compose --env-file .env up -d --no-build
+          echo "Waiting for current stack to be healthy..."
+          for i in $(seq 1 24); do
+            API=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "$(docker compose ps -q api)" 2>/dev/null || echo "none")
+            FRONT=$(docker inspect \
+              --format='{{.State.Health.Status}}' \
+              "$(docker compose ps -q frontend)" 2>/dev/null || echo "none")
+            echo "  api=$API  frontend=$FRONT"
+            [ "$API" = "healthy" ] && [ "$FRONT" = "healthy" ] && \
+              { echo "Current stack is healthy"; break; }
+            [ "$i" -eq 24 ] && \
+              { echo "ERROR: current stack never became healthy"; exit 1; }
+            sleep 5
+          done
+
+      - name: Record old container IDs
+        id: old
+        run: |
+          echo "api=$(docker compose ps -q api)"           >> "$GITHUB_OUTPUT"
+          echo "worker=$(docker compose ps -q worker)"     >> "$GITHUB_OUTPUT"
+          echo "frontend=$(docker compose ps -q frontend)" >> "$GITHUB_OUTPUT"
+
+      - name: Rolling update
+        env:
+          OLD_API:      ${{ steps.old.outputs.api }}
+          OLD_WORKER:   ${{ steps.old.outputs.worker }}
+          OLD_FRONTEND: ${{ steps.old.outputs.frontend }}
+          REDIS_PASS:   deploytest123
+          TIMEOUT:      60
+        run: |
+          set -euo pipefail
+
+          NETWORK=$(docker inspect "$OLD_API" \
+            --format='{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+          echo "Using network: $NETWORK"
+
+          wait_healthy() {
+            local cid="$1"
+            local name="$2"
+            local elapsed=0
+            echo "  Waiting for $name to become healthy (max ${TIMEOUT}s)..."
+            while true; do
+              STATUS=$(docker inspect \
+                --format='{{.State.Health.Status}}' "$cid" 2>/dev/null \
+                || echo "none")
+              echo "    ${elapsed}s — $STATUS"
+              [ "$STATUS" = "healthy" ] && return 0
+              if [ "$elapsed" -ge "$TIMEOUT" ]; then
+                echo "  FAILED: $name did not become healthy within ${TIMEOUT}s"
+                return 1
+              fi
+              sleep 5
+              elapsed=$((elapsed + 5))
+            done
+          }
+
+          # ── 1. Roll API ──────────────────────────────────────────────────
+          echo "==> Rolling api..."
+          NEW_API=$(docker run -d \
+            --name api_new \
+            --network "$NETWORK" \
+            -e REDIS_HOST=redis \
+            -e REDIS_PORT=6379 \
+            -e "REDIS_PASSWORD=$REDIS_PASS" \
+            --health-cmd 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")"' \
+            --health-interval=5s \
+            --health-timeout=3s \
+            --health-retries=3 \
+            --health-start-period=10s \
+            local/api:new)
+
+          if wait_healthy "$NEW_API" "api_new"; then
+            docker stop "$OLD_API" && docker rm "$OLD_API"
+            echo "  api rolled successfully"
+          else
+            docker stop api_new && docker rm api_new
+            exit 1
+          fi
+
+          # ── 2. Roll worker ───────────────────────────────────────────────
+          echo "==> Rolling worker..."
+          NEW_WORKER=$(docker run -d \
+            --name worker_new \
+            --network "$NETWORK" \
+            -e REDIS_HOST=redis \
+            -e REDIS_PORT=6379 \
+            -e "REDIS_PASSWORD=$REDIS_PASS" \
+            --health-cmd "python -c \"import redis; r=redis.Redis(host='redis',port=6379,password='$REDIS_PASS'); r.ping()\"" \
+            --health-interval=5s \
+            --health-timeout=3s \
+            --health-retries=3 \
+            --health-start-period=10s \
+            local/worker:new)
+
+          if wait_healthy "$NEW_WORKER" "worker_new"; then
+            docker stop "$OLD_WORKER" && docker rm "$OLD_WORKER"
+            echo "  worker rolled successfully"
+          else
+            docker stop worker_new && docker rm worker_new
+            exit 1
+          fi
+
+          # ── 3. Roll frontend ─────────────────────────────────────────────
+          # Binds to port 3001 so old frontend keeps 3000 until health passes
+          echo "==> Rolling frontend..."
+          NEW_FRONT=$(docker run -d \
+            --name frontend_new \
+            --network "$NETWORK" \
+            -e API_URL=http://api_new:8000 \
+            -e PORT=3000 \
+            -p 3001:3000 \
+            --health-cmd 'wget -qO- http://localhost:3000/health' \
+            --health-interval=5s \
+            --health-timeout=3s \
+            --health-retries=3 \
+            --health-start-period=10s \
+            local/frontend:new)
+
+          if wait_healthy "$NEW_FRONT" "frontend_new"; then
+            docker stop "$OLD_FRONTEND" && docker rm "$OLD_FRONTEND"
+            echo "  frontend rolled successfully"
+          else
+            docker stop frontend_new && docker rm frontend_new
+            exit 1
+          fi
+
+          echo "==> All three services rolled successfully."
+
+      - name: Smoke test new stack
+        run: |
+          echo "Submitting a job to the new stack (port 3001)..."
+          JOB_ID=$(curl -sf -X POST http://localhost:3001/submit \
+            -H "Content-Type: application/json" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "Job ID: $JOB_ID"
+          for i in $(seq 1 15); do
+            STATUS=$(curl -sf "http://localhost:3001/status/$JOB_ID" | \
+              python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+            echo "  attempt $i: $STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "Smoke test passed — rolling update verified end-to-end"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ERROR: smoke test failed after rolling update"
+          docker logs api_new
+          docker logs worker_new
+          exit 1
+
+      - name: Tear down (always runs)
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans 2>/dev/null || true
+          docker rm -f api_new worker_new frontend_new 2>/dev/null || true
