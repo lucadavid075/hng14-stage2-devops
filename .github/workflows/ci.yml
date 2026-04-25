@@ -250,7 +250,7 @@ jobs:
 # STAGE 5 — INTEGRATION TEST
 # ─────────────────────────────────────────────────────────────────────────────
   integration:
-    name: integration Test
+    name: integration test
     runs-on: ubuntu-latest
     needs: security
     steps:
